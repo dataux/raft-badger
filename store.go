@@ -5,7 +5,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/dgraph-io/badger/badger"
+	"github.com/dgraph-io/badger"
 	"github.com/hashicorp/raft"
 )
 
@@ -36,7 +36,7 @@ func NewStableStore(dir string, opt *badger.Options) (StableStore, error) {
 // --------------------------------------------------------------------
 
 type store struct {
-	kv *badger.KV
+	kv *badger.DB
 }
 
 func newStore(dir string, opt *badger.Options) (*store, error) {
@@ -45,12 +45,13 @@ func newStore(dir string, opt *badger.Options) (*store, error) {
 		*opt = badger.DefaultOptions
 	}
 	opt.Dir = dir
+	opt.ValueDir = dir
 
 	if err := os.MkdirAll(opt.Dir, 0777); err != nil {
 		return nil, err
 	}
 
-	kv, err := badger.NewKV(opt)
+	kv, err := badger.Open(*opt)
 	if err != nil {
 		return nil, err
 	}
@@ -70,13 +71,24 @@ func (s *store) LastIndex() (uint64, error) { return s.firstIndex(true) }
 
 // GetLog is used to retrieve a log from BoltDB at a given index.
 func (s *store) GetLog(idx uint64, log *raft.Log) error {
-	var item badger.KVItem
-	if err := s.kv.Get(uint64ToBytes(idx), &item); err != nil {
+
+	txn := s.kv.NewTransaction(false)
+	defer txn.Commit(nil)
+
+	item, err := txn.Get(uint64ToBytes(idx))
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			return raft.ErrLogNotFound
+		}
 		return err
-	} else if item.Value() == nil {
+	}
+	val, err := item.Value()
+	if val == nil {
 		return raft.ErrLogNotFound
 	}
-	return gobDecode(item.Value(), log)
+	err = gobDecode(val, log)
+	//u.Debugf("GetLog idx:%v  %v  log: %+v err=%v", idx, val, log, err)
+	return err
 }
 
 // StoreLog is used to store a single raft log
@@ -87,55 +99,79 @@ func (s *store) StoreLog(log *raft.Log) error {
 	}
 	defer bufPool.Put(buf)
 
-	return s.kv.Set(uint64ToBytes(log.Index), buf.Bytes())
+	txn := s.kv.NewTransaction(true)
+	defer txn.Commit(nil)
+
+	return txn.Set(uint64ToBytes(log.Index), buf.Bytes())
 }
 
 // StoreLogs is used to store a set of raft logs
 func (s *store) StoreLogs(logs []*raft.Log) error {
-	entries := make([]*badger.Entry, 0, len(logs))
+
 	for _, log := range logs {
 		buf, err := gobEncode(log)
 		if err != nil {
 			return err
 		}
-		defer bufPool.Put(buf)
-
-		key := uint64ToBytes(log.Index)
-		entries = badger.EntriesSet(entries, key, buf.Bytes())
+		txn := s.kv.NewTransaction(true)
+		err = txn.Set(uint64ToBytes(log.Index), buf.Bytes())
+		bufPool.Put(buf)
+		if err != nil {
+			txn.Discard()
+			return nil
+		}
+		txn.Commit(nil)
 	}
-	return s.kv.BatchSet(entries)
+
+	return nil
 }
 
 // DeleteRange is used to delete logs within a given range inclusively.
 func (s *store) DeleteRange(min, max uint64) error {
-	it := s.kv.NewIterator(badger.IteratorOptions{PrefetchSize: 100})
-	defer it.Close()
+	txn := s.kv.NewTransaction(true)
+	itr := txn.NewIterator(badger.DefaultIteratorOptions)
+	defer itr.Close()
 
-	var entries []*badger.Entry
-	for it.Seek(uint64ToBytes(min)); it.Valid(); it.Next() {
-		key := it.Item().Key()
+	for itr.Seek(uint64ToBytes(min)); itr.Valid(); itr.Next() {
+		key := itr.Item().Key()
 		if bytesToUint64(key) > max {
 			break
 		}
-		entries = badger.EntriesDelete(entries, key)
+		err := txn.Delete(key)
+		if err != nil {
+			txn.Discard()
+			return err
+		}
 	}
-	return s.kv.BatchSet(entries)
+
+	return txn.Commit(nil)
 }
 
 // Set is used to set a key/value set outside of the raft log
 func (s *store) Set(k, v []byte) error {
-	return s.kv.Set(k, v)
+	txn := s.kv.NewTransaction(true)
+	defer txn.Commit(nil)
+	return txn.Set(k, v)
 }
 
 // Get is used to retrieve a value from the k/v store by key
 func (s *store) Get(k []byte) ([]byte, error) {
-	var item badger.KVItem
-	if err := s.kv.Get(k, &item); err != nil {
+
+	txn := s.kv.NewTransaction(false)
+	defer txn.Commit(nil)
+
+	item, err := txn.Get(k)
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			return nil, ErrKeyNotFound
+		}
 		return nil, err
-	} else if item.Value() == nil {
+	}
+	val, err := item.Value()
+	if val == nil {
 		return nil, ErrKeyNotFound
 	}
-	return item.Value(), nil
+	return val, nil
 }
 
 // SetUint64 is like Set, but handles uint64 values
@@ -153,15 +189,19 @@ func (s *store) GetUint64(key []byte) (uint64, error) {
 }
 
 func (s *store) firstIndex(reverse bool) (uint64, error) {
-	it := s.kv.NewIterator(badger.IteratorOptions{
-		PrefetchSize: 1,
-		FetchValues:  false,
-		Reverse:      reverse,
-	})
-	defer it.Close()
+	opt := badger.DefaultIteratorOptions
+	opt.PrefetchSize = 1
+	opt.PrefetchValues = false
+	opt.Reverse = reverse
 
-	for it.Rewind(); it.Valid(); it.Next() {
-		return bytesToUint64(it.Item().Key()), nil
+	txn := s.kv.NewTransaction(false)
+	defer txn.Commit(nil)
+
+	itr := txn.NewIterator(opt)
+	defer itr.Close()
+
+	for itr.Rewind(); itr.Valid(); itr.Next() {
+		return bytesToUint64(itr.Item().Key()), nil
 	}
 	return 0, nil
 }

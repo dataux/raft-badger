@@ -10,6 +10,8 @@ import (
 	. "github.com/onsi/gomega"
 )
 
+var _ = u.EMPTY
+
 var _ = Describe("LogStore", func() {
 	var subject raft.LogStore
 	var dir string
